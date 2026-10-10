@@ -7,7 +7,7 @@ import requests
 import base58
 from nacl.signing import SigningKey
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://new-oos.preview.emergentagent.com").rstrip("/") + "/api"
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://canvas-los.preview.emergentagent.com").rstrip("/") + "/api"
 
 
 # ---------- helpers ----------

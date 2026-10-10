@@ -6,8 +6,8 @@ import requests
 BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/") + "/api"
 # Realistic browser Origin to prove our proxy doesn't 403 even when the request looks browser-ish.
 BROWSER_HEADERS = {
-    "Origin": "https://74e74f53-7c20-4cf9-9858-e2ec2a029901.preview.emergentagent.com",
-    "Referer": "https://74e74f53-7c20-4cf9-9858-e2ec2a029901.preview.emergentagent.com/",
+    "Origin": "https://canvas-los.preview.emergentagent.com",
+    "Referer": "https://canvas-los.preview.emergentagent.com/",
     "Content-Type": "application/json",
 }
 

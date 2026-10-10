@@ -21,10 +21,11 @@ export function CreateVault({ me, onDone }) {
   const [deposit, setDeposit] = useState("");
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState("");
+  const [error, setError] = useState("");
   const cfg = ConfigContext.current;
 
   const create = async () => {
-    setBusy(true);
+    setBusy(true); setError("");
     try {
       setStage("Generating one-time Winternitz key…");
       const { data } = await api.post("/vault/create", { deposit_sol: parseFloat(deposit) || 0 });
@@ -38,6 +39,7 @@ export function CreateVault({ me, onDone }) {
       toast.success("Quantum vault opened on mainnet");
       onDone?.();
     } catch (e) {
+      setError(errMsg(e, "Could not open vault"));
       toast.error(errMsg(e, "Could not open vault"));
     } finally { setBusy(false); setStage(""); }
   };
@@ -66,6 +68,7 @@ export function CreateVault({ me, onDone }) {
           className="btn-sheen mt-4 h-12 w-full rounded-none bg-quantum-green font-mono font-bold text-black hover:bg-quantum-greenDark">
           <Vault weight="fill" className="mr-2 h-5 w-5" /> {busy ? stage || "Working…" : "Generate key & open vault"}
         </Button>
+        {error && <p data-testid="create-vault-error" className="mt-2 font-plex-mono text-xs text-red-400">{error}</p>}
       </div>
       <div className="flex items-center justify-center bg-black p-6"><KeygenAnimation /></div>
     </motion.div>

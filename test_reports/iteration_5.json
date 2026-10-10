@@ -1,0 +1,40 @@
+{
+  "summary": "Full backend + frontend verification of the QUANTUM-SAFE TRANSACTION LAYER pivot (merchant/invoice removed, Winternitz vault model). Backend: 30/30 pytest pass (new /app/backend/tests/test_quantum_api.py — 25 tests + old test_rpc_proxy.py — 5 tests). Removed stale /app/backend/tests/test_auth_origin.py (merchant/invoice references, intentionally removed feature). Frontend: ALL requested flows verified using fake Phantom (WebCrypto-shaped provider backed by cryptography.hazmat Ed25519 + page.expose_function). Explicitly verified: (a) landing hero 'The quantum-safe transaction layer for Solana', how-it-works-section with flow-diagram + how-step-01..05, read-docs-btn → /docs, landing-docs-link; (b) /docs sticky TOC with all 9 TOC items (toc-overview..references) scrolling, 14 docs-ref-link entries incl. rabb757/winternitz-vault github href, flow-diagram, docs-open-wallet=/app; (c) nav-wallet/nav-docs; header-connect-btn when logged out; wallet-chip + logout-btn when logged in; (d) SIWS real Ed25519 verify via backend end-to-end; (e) /app logged-out shows wallet-connect-btn; after connect shows create-vault-btn with create-cost text '0.00268 SOL'; (f) create-vault with rejecting Phantom ({code:4001}) — UI remained usable, create-vault-btn still visible; (g) after mongo-flipping vault.status='open' the open-vault dashboard shows balance-card (vault-balance '0'), all 4 action-send/receive/deposit/withdraw open their dialogs, receive-qr + copy-pay-link (contains amount=0.5 after fill) + copy-my-address, withdraw-partial/all tabs switch content, send route-badge resolves 'Plain wallet…native SOL', 'Your own Phantom. This counts as a withdrawal.', and 'Has a quantum vault, so it arrives vault-to-vault…', over-spend 999 SOL shows 'Exceeds your spendable balance' and send-submit-btn disabled; (h) /pay/<open-vault-addr>?amount=0.25&memo=Dinner shows pay-card + pay-amount-fixed '0.25 SOL' + pay-memo + pay-phantom-btn; /pay/11111111111111111111111111111111 shows pay-no-vault; /pay/notanaddress shows pay-error; (i) mobile 390x844 scrollWidth=390 for /, /docs, /app and /pay (no horizontal overflow).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_quantum_api.py",
+    "/app/backend/tests/test_rpc_proxy.py",
+    "/app/backend/tests/e2e_litesvm.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Minor: on-chain tx rejection path (signAndSendTransaction code:4001) does not surface a visible Sonner toast in CreateVault — the UI stays usable so this is cosmetic, but consider toast.error(e.message) in CreateVault to match the pattern used elsewhere (Send/Pay)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 961 lines — approaching the 700-line threshold. Clean modularisation into auth/vault/transfers/rpc routers would help, but it is tightly cohesive now and all tests pass.",
+    "Idempotent /api/vault/create correctly reuses the existing created vault doc (verified by test_create_vault_is_idempotent) — same vault_id and address on repeat calls.",
+    "/api/vault/confirm-open returns 409 when the vault isn't on-chain yet (verified) — but note the 409 message 'Vault not yet visible on-chain' triggers even when the user has NO real tx (as in test). That is correct behaviour for the UI retry loop, but could log a one-line warning server-side to help debug stuck 'confirming' states in production.",
+    "/api/transfers/prepare correctly 400s with 'Open your quantum vault first' when vault.status != open (verified).",
+    "/api/pay/<addr>/deposit-ixs 404s when the recipient has no OPEN vault (verified against a 'created' vault doc — exact spec behaviour).",
+    "RPC proxy allow-list rejects requestAirdrop (400) and missing method (400); allows getLatestBlockhash / getBlockHeight (verified).",
+    "SIWS challenge is one-shot (find_one_and_delete) — verified: second verify with same message returns 401. Good replay protection.",
+    "No MongoDB _id leakage anywhere (all find queries project {_id:0}). Clean.",
+    "resolve_recipient treats a 'created' (not yet open) vault as kind=wallet — this is intentional and matches the UI expectation that only open vaults can receive vault-to-vault. Documented via the send-route-badge behaviour.",
+    "SendDialog over-spend validation also runs client-side (amt > spendable+1e-12) in addition to server-side 400 — nice defence in depth.",
+    "Landing page shows 'Install Phantom' link when hasPhantom===false; in automated tests the fake provider is injected via add_init_script BEFORE navigation, so hasPhantom is true. In production this flow needs manual check with a real browser.",
+    "The watcher_loop sleeps 10s on startup then every 30s — ok for the preview; a production deployment should surface its failures through structured logging rather than warnings.",
+    "CreateVault rejection path does not toast — minor UX gap (see action_items)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_quantum_api.py (new, 25 tests)",
+    "/app/backend/tests/test_auth_origin.py (removed — referenced the removed merchant/invoice API)"
+  ],
+  "success_rate": {"backend": "100% (30/30 pytest; 28/28 LiteSVM e2e untouched)", "frontend": "100% of requested flows"},
+  "test_credentials": "No credentials. Auth is Phantom SIWS Ed25519. Throwaway cryptography.hazmat Ed25519 keypairs are generated per run; address encoded with a pure-stdlib base58 helper. Fake Phantom (window.solana) is injected via page.add_init_script before navigation and signs via page.expose_function('pySignMessage').",
+  "seed_data_creation": "Each run creates two temporary throwaway users (sender + recipient), each with a 'created' vault doc then force-flipped to status='open' in Mongo (collection quantumpos_database.vaults) because real mainnet tx signing is impossible. All created users/vaults/transfers/challenges are cleaned up at the end of the Playwright run (see mongo_cleanup).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend ground truth = /app/backend/tests/test_quantum_api.py (30 tests, 100% pass) + /app/backend/tests/e2e_litesvm.py (28/28, do not re-implement). Run with: cd /app/backend && REACT_APP_BACKEND_URL=$(grep REACT_APP_BACKEND_URL /app/frontend/.env | cut -d= -f2) /root/.venv/bin/python -m pytest tests/test_quantum_api.py tests/test_rpc_proxy.py -v --junitxml=/app/test_reports/pytest/pytest_results.xml. For the Playwright fake-Phantom harness: pymongo is NOT in the browser-automation Python; call /root/.venv/bin/python via subprocess to touch Mongo. The vault open-state cannot be reached without a real tx — flip db.vaults.{owner:<addr>}.status to 'open' directly after calling POST /api/vault/create. Do NOT wait for signAndSendTransaction success in the fake Phantom — reject with {code:4001} and verify the UI stays usable. One small cosmetic gap: CreateVault's 4001 rejection does not toast; everything else does.",
+  "rca of the issue": "N/A — no bugs found this iteration. The pivot from merchant POS to quantum vault is complete and consistent across backend endpoints, SIWS auth, UI routing, docs, pay links and mobile layout."
+}

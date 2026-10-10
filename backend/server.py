@@ -1,13 +1,20 @@
+"""
+QuantumPOS — quantum-safe transaction layer on Solana (vault program: github.com/rabb757/winternitz-vault).
+
+Each user owns ONE permanent Winternitz vault PDA (["vault", first_pk_hash]). SOL is held as wrapped
+SOL in the vault's associated token account. Every spend is authorised by a one-time WOTS signature
+over (nonce, source, destination, amount, next_pk_hash) and rotates the key in place — the vault
+address never changes. Recipients are plain Solana addresses; registered users receive vault-to-vault.
+"""
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header
-from fastapi.responses import PlainTextResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-import os, logging, uuid, secrets, asyncio, io, csv, re
+import os, logging, uuid, secrets, asyncio, time
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional
 
 import jwt
 import base58
@@ -18,7 +25,7 @@ from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field
 from solders.pubkey import Pubkey
 
-import winternitz as wots
+import wntr
 import solana_vault as sv
 
 ROOT_DIR = Path(__file__).parent
@@ -35,12 +42,20 @@ CHALLENGE_TTL_MIN = 5
 AUTH_DOMAIN = os.environ.get("AUTH_DOMAIN", "localhost")
 RPC_URL = os.environ["SOLANA_RPC_URL"]
 CLUSTER = os.environ.get("SOLANA_CLUSTER", "mainnet-beta")
+PROGRAM_ID = os.environ["VAULT_PROGRAM_ID"]
 fernet = Fernet(os.environ["WOTS_ENC_KEY"].encode())
+
+LPS = sv.LAMPORTS_PER_SOL
+# Rent-exempt minimums — refreshed from the cluster at startup (mainnet rent has changed over time).
+RENT = {"token": sv.TOKEN_ACCOUNT_RENT_LAMPORTS, "vault": sv.VAULT_RENT_LAMPORTS, "wallet": sv.WALLET_RENT_LAMPORTS}
+CU_LIMIT = 1_400_000          # WOTS verify = ~4.3k keccak avg, 8.7k worst case
+CU_PRICE_MICROLAMPORTS = 2_000
+SYSTEM_OWNER = "11111111111111111111111111111111"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("quantumpos")
 
-app = FastAPI(title="QuantumPOS")
+app = FastAPI(title="QuantumPOS Transaction Layer")
 api = APIRouter(prefix="/api")
 
 
@@ -53,50 +68,8 @@ def iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def public_invoice(inv: dict, include_merchant_name: Optional[str] = None) -> dict:
-    received_lamports = max(0, (inv.get("observed_lamports") or 0) - (inv.get("rent_baseline") or 0))
-    tip_lamports = max(0, received_lamports - inv["amount_lamports"]) if inv.get("allow_tips", True) else 0
-    return {
-        "id": inv["id"],
-        "amount_sol": inv["amount_sol"],
-        "amount_lamports": inv["amount_lamports"],
-        "memo": inv.get("memo", ""),
-        "status": inv["status"],
-        "vault_address": inv["vault_address"],
-        "merkle_root": inv["merkle_root_hex"],
-        "bump": inv["bump"],
-        "open_tx_sig": inv.get("open_tx_sig"),
-        "close_tx_sig": inv.get("close_tx_sig"),
-        "received_lamports": received_lamports,
-        "received_sol": received_lamports / sv.LAMPORTS_PER_SOL,
-        "tip_lamports": tip_lamports,
-        "tip_sol": tip_lamports / sv.LAMPORTS_PER_SOL,
-        "allow_tips": inv.get("allow_tips", True),
-        "split_address": inv.get("split_address"),
-        "split_type": inv.get("split_type"),
-        "split_value": inv.get("split_value"),
-        "key_used": inv.get("key_used", False),
-        "usd_rate": inv.get("usd_rate"),
-        "cluster": CLUSTER,
-        "created_at": inv["created_at"],
-        "expires_at": inv["expires_at"],
-        "paid_at": inv.get("paid_at"),
-        "settled_at": inv.get("settled_at"),
-        "merchant_name": (inv.get("branding") or {}).get("name") or include_merchant_name,
-        "branding": inv.get("branding") or {},
-        "solana_pay_url": solana_pay_url(inv),
-        "explorer_open": explorer_tx(inv.get("open_tx_sig")),
-        "explorer_close": explorer_tx(inv.get("close_tx_sig")),
-    }
-
-
-def solana_pay_url(inv: dict) -> str:
-    from urllib.parse import quote
-    base = f"solana:{inv['vault_address']}?amount={inv['amount_sol']}"
-    label = quote("QuantumPOS Payment")
-    msg = quote(inv.get("memo") or f"Invoice {inv['id'][:8]}")
-    ref = inv["vault_address"]
-    return f"{base}&label={label}&message={msg}&reference={ref}"
+def parse_iso(s: Optional[str]) -> Optional[datetime]:
+    return datetime.fromisoformat(s) if s else None
 
 
 def explorer_tx(sig: Optional[str]) -> Optional[str]:
@@ -106,9 +79,18 @@ def explorer_tx(sig: Optional[str]) -> Optional[str]:
     return f"https://explorer.solana.com/tx/{sig}{suffix}"
 
 
-def explorer_address(addr: str) -> str:
+def explorer_address(addr: Optional[str]) -> Optional[str]:
+    if not addr:
+        return None
     suffix = "" if CLUSTER == "mainnet-beta" else f"?cluster={CLUSTER}"
     return f"https://explorer.solana.com/address/{addr}{suffix}"
+
+
+def valid_solana_address(address: str) -> bool:
+    try:
+        return len(base58.b58decode(address)) == 32
+    except Exception:
+        return False
 
 
 RPC_FALLBACKS = [u.strip() for u in os.environ.get("SOLANA_RPC_FALLBACKS", "https://solana-rpc.publicnode.com").split(",") if u.strip()]
@@ -116,8 +98,7 @@ RPC_ENDPOINTS = [RPC_URL] + [u for u in RPC_FALLBACKS if u != RPC_URL]
 
 
 async def rpc_raw(payload) -> dict:
-    """POST a JSON-RPC payload server-side (no browser Origin -> public RPCs don't 403),
-    trying the primary endpoint then fallbacks."""
+    """POST a JSON-RPC payload server-side (public RPCs 403 browser origins), with fallbacks."""
     last_err = None
     async with httpx.AsyncClient(timeout=20) as hc:
         for url in RPC_ENDPOINTS:
@@ -149,27 +130,42 @@ async def get_balance(address: str) -> int:
     return res["value"]
 
 
-async def get_account_owner(address: str) -> Optional[str]:
+async def get_account(address: str) -> Optional[dict]:
     res = await rpc_call("getAccountInfo", [address, {"commitment": "confirmed", "encoding": "base64"}])
-    if res["value"] is None:
-        return None
-    return res["value"]["owner"]
+    return res["value"]
 
 
-# ----------------------------- auth -----------------------------
-def valid_solana_address(address: str) -> bool:
+async def is_program_vault(address: str) -> bool:
+    acc = await get_account(address)
+    return bool(acc and acc.get("owner") == PROGRAM_ID)
+
+
+_price_cache = {"v": None, "t": 0.0}
+
+
+async def fetch_sol_usd() -> Optional[float]:
+    if _price_cache["v"] and time.time() - _price_cache["t"] < 60:
+        return _price_cache["v"]
     try:
-        return len(base58.b58decode(address)) == 32
-    except Exception:
-        return False
+        async with httpx.AsyncClient(timeout=10) as hc:
+            r = await hc.get("https://api.coingecko.com/api/v3/simple/price",
+                             params={"ids": "solana", "vs_currencies": "usd"})
+            if r.status_code == 200:
+                v = r.json().get("solana", {}).get("usd")
+                if v:
+                    _price_cache.update(v=v, t=time.time())
+                return v
+    except Exception as e:
+        logger.warning(f"price fetch failed: {e}")
+    return _price_cache["v"]
 
 
+# ----------------------------- auth (SIWS) -----------------------------
 SIWS_CHAIN = {"mainnet-beta": "mainnet", "devnet": "devnet", "testnet": "testnet"}.get(CLUSTER, CLUSTER)
 
 
 def resolve_auth_origin(origin_header: Optional[str]) -> tuple:
-    """Phantom blocks SIWS messages whose domain/URI don't match the requesting page,
-    so bind the challenge to the actual browser origin (falls back to AUTH_DOMAIN)."""
+    """Phantom blocks SIWS messages whose domain/URI don't match the requesting page."""
     if origin_header:
         parsed = urlparse(origin_header)
         if parsed.scheme in ("http", "https") and parsed.netloc:
@@ -183,7 +179,7 @@ def build_challenge_message(address: str, nonce: str, issued: datetime, expires:
     uri = uri or f"https://{domain}"
     return (
         f"{domain} wants you to sign in with your Solana account:\n{address}\n\n"
-        f"Sign in to QuantumPOS merchant dashboard.\n\n"
+        f"Sign in to the QuantumPOS quantum-safe transaction layer.\n\n"
         f"URI: {uri}\nVersion: 1\nChain ID: solana:{SIWS_CHAIN}\n"
         f"Nonce: {nonce}\nIssued At: {iso(issued)}\nExpiration Time: {iso(expires)}"
     )
@@ -237,20 +233,16 @@ async def auth_verify(body: VerifyIn):
     except (ValueError, BadSignatureError):
         raise HTTPException(401, "Invalid signature")
 
-    merchant = await db.merchants.find_one({"address": body.address}, {"_id": 0})
-    if not merchant:
-        merchant = {
-            "id": str(uuid.uuid4()), "address": body.address,
-            "payout_address": body.address, "business_name": "",
-            "created_at": iso(now()),
-        }
-        await db.merchants.insert_one(dict(merchant))
+    user = await db.users.find_one({"address": body.address}, {"_id": 0})
+    if not user:
+        user = {"id": str(uuid.uuid4()), "address": body.address, "created_at": iso(now())}
+        await db.users.insert_one(dict(user))
     expires = now() + timedelta(days=SESSION_TTL_DAYS)
     token = jwt.encode({"sub": body.address, "exp": expires, "iat": now()}, JWT_SECRET, algorithm=JWT_ALGO)
-    return {"token": token, "merchant": merchant}
+    return {"token": token, "user": user}
 
 
-async def current_merchant(authorization: Optional[str] = Header(default=None)) -> dict:
+async def current_user(authorization: Optional[str] = Header(default=None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Not authenticated")
     token = authorization.split(" ", 1)[1]
@@ -258,404 +250,598 @@ async def current_merchant(authorization: Optional[str] = Header(default=None)) 
         claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except jwt.PyJWTError:
         raise HTTPException(401, "Invalid or expired session")
-    merchant = await db.merchants.find_one({"address": claims.get("sub")}, {"_id": 0})
-    if not merchant:
-        raise HTTPException(401, "Merchant not found")
-    return merchant
+    user = await db.users.find_one({"address": claims.get("sub")}, {"_id": 0})
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
 
 
 @api.get("/auth/me")
-async def auth_me(merchant: dict = Depends(current_merchant)):
-    return merchant
+async def auth_me(user: dict = Depends(current_user)):
+    return user
 
 
-HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-LOGO_MAX_CHARS = 400_000  # ~300 KB data URL
-SOCIAL_KEYS = ("x", "instagram", "telegram", "discord")
+# ----------------------------- vault model -----------------------------
+def enc(b: bytes) -> str:
+    return fernet.encrypt(b).decode()
 
 
-class BrandingIn(BaseModel):
-    name: Optional[str] = ""
-    logo: Optional[str] = ""          # data:image/... URL (client-resized)
-    accent_color: Optional[str] = "#14F195"
-    tagline: Optional[str] = ""
-    website: Optional[str] = ""
-    socials: Optional[dict] = None    # {x, instagram, telegram, discord}
+def dec(s: str) -> bytes:
+    return fernet.decrypt(s.encode())
 
 
-def _clean_url(u: Optional[str]) -> str:
-    u = (u or "").strip()[:300]
-    if not u:
-        return ""
-    if not re.match(r"^https?://", u, re.I):
-        u = "https://" + u
-    return u
-
-
-def clean_branding(b: Optional[BrandingIn]) -> dict:
-    if b is None:
-        return {}
-    logo = (b.logo or "").strip()
-    if logo:
-        if not logo.startswith("data:image/"):
-            raise HTTPException(400, "Logo must be an image")
-        if len(logo) > LOGO_MAX_CHARS:
-            raise HTTPException(400, "Logo is too large (max ~300 KB)")
-    accent = (b.accent_color or "#14F195").strip()
-    if not HEX_RE.match(accent):
-        raise HTTPException(400, "Accent colour must be a hex value like #14F195")
-    socials = {}
-    for k in SOCIAL_KEYS:
-        v = _clean_url((b.socials or {}).get(k))
-        if v:
-            socials[k] = v
-    return {
-        "name": (b.name or "").strip()[:80],
-        "logo": logo,
-        "accent_color": accent,
-        "tagline": (b.tagline or "").strip()[:140],
-        "website": _clean_url(b.website),
-        "socials": socials,
-    }
-
-
-class ProfileIn(BaseModel):
-    business_name: Optional[str] = None
-    payout_address: Optional[str] = None
-    branding: Optional[BrandingIn] = None
-
-
-@api.put("/merchant/profile")
-async def update_profile(body: ProfileIn, merchant: dict = Depends(current_merchant)):
-    updates = {}
-    if body.business_name is not None:
-        updates["business_name"] = body.business_name.strip()
-    if body.payout_address is not None:
-        if not valid_solana_address(body.payout_address):
-            raise HTTPException(400, "Invalid payout address")
-        updates["payout_address"] = body.payout_address
-    if body.branding is not None:
-        updates["branding"] = clean_branding(body.branding)
-        if updates["branding"]["name"] and body.business_name is None:
-            updates["business_name"] = updates["branding"]["name"]
-    if updates:
-        await db.merchants.update_one({"address": merchant["address"]}, {"$set": updates})
-    return await db.merchants.find_one({"address": merchant["address"]}, {"_id": 0})
-
-
-# ----------------------------- invoices -----------------------------
-class InvoiceIn(BaseModel):
-    amount_sol: float = Field(gt=0)
-    memo: Optional[str] = ""
-    expiry_minutes: int = Field(default=60, ge=5, le=1440)
-    allow_tips: bool = True
-    split_address: Optional[str] = None
-    split_type: Optional[str] = None   # "percent" | "fixed"
-    split_value: Optional[float] = None
-    branding: Optional[BrandingIn] = None
-
-
-async def fetch_sol_usd() -> Optional[float]:
+async def read_vault_state(address: str) -> Optional[dict]:
+    """Parse the on-chain vault account (nonce + current pk_hash). None if not initialized."""
+    acc = await get_account(address)
+    if not acc or acc.get("owner") != PROGRAM_ID:
+        return None
+    import base64 as _b64
     try:
-        async with httpx.AsyncClient(timeout=10) as hc:
-            r = await hc.get("https://api.coingecko.com/api/v3/simple/price",
-                             params={"ids": "solana", "vs_currencies": "usd"})
-            if r.status_code == 200:
-                return r.json().get("solana", {}).get("usd")
+        return sv.parse_vault(_b64.b64decode(acc["data"][0]))
+    except ValueError:
+        return None
+
+
+async def ata_info(ata: str) -> tuple:
+    """(lamports, rent_exempt_reserve) of a wSOL token account; (0, 0) if it doesn't exist.
+    The reserve is read from the account itself (is_native COption<u64> at offset 109)."""
+    acc = await get_account(ata)
+    if not acc:
+        return 0, 0
+    import base64 as _b64
+    reserve = RENT["token"]
+    try:
+        d = _b64.b64decode(acc["data"][0])
+        if len(d) >= 121 and int.from_bytes(d[109:113], "little") == 1:
+            reserve = int.from_bytes(d[113:121], "little")
+    except Exception:
+        pass
+    return acc.get("lamports", 0), reserve
+
+
+async def ata_lamports(ata: str) -> int:
+    return (await ata_info(ata))[0]
+
+
+def spendable_of(lamports: int, reserve: Optional[int] = None) -> int:
+    if not lamports:
+        return 0
+    return max(0, lamports - (reserve if reserve is not None else RENT["token"]))
+
+
+def public_vault(v: Optional[dict]) -> Optional[dict]:
+    if not v:
+        return None
+    lam = v.get("lamports") or 0
+    sp = spendable_of(lam, v.get("reserve")) if v["status"] == "open" else 0
+    return {
+        "id": v["id"],
+        "owner": v["owner"],
+        "address": v["address"],
+        "token_account": v["ata"],
+        "status": v["status"],                 # created | open
+        "nonce": v.get("nonce", 0),
+        "pk_hash": v["pk_hex"],
+        "vault_id": v["vault_id_hex"],
+        "lamports": lam,
+        "spendable_lamports": sp,
+        "spendable_sol": sp / LPS,
+        "key_exposed": v.get("exposed_nonce") is not None and v.get("exposed_nonce") == v.get("nonce"),
+        "open_tx_sig": v.get("open_tx_sig"),
+        "explorer": explorer_address(v["address"]),
+        "explorer_token": explorer_address(v["ata"]),
+        "explorer_open": explorer_tx(v.get("open_tx_sig")),
+        "created_at": v["created_at"],
+        "opened_at": v.get("opened_at"),
+    }
+
+
+async def get_vault(owner: str) -> Optional[dict]:
+    return await db.vaults.find_one({"owner": owner}, {"_id": 0})
+
+
+async def refresh_balance(v: dict) -> dict:
+    try:
+        lam, reserve = await ata_info(v["ata"])
     except Exception as e:
-        logger.warning(f"price fetch failed: {e}")
-    return None
+        logger.warning(f"balance refresh failed {v['ata']}: {e}")
+        return v
+    if lam != v.get("lamports") or (lam and reserve != v.get("reserve")):
+        upd = {"lamports": lam, **({"reserve": reserve} if lam else {})}
+        await db.vaults.update_one({"id": v["id"]}, {"$set": upd})
+        v = {**v, **upd}
+    return v
 
 
-@api.get("/price")
-async def price():
-    return {"sol_usd": await fetch_sol_usd()}
-
-
-@api.post("/invoices")
-async def create_invoice(body: InvoiceIn, merchant: dict = Depends(current_merchant)):
-    split_address = None
-    split_type = None
-    split_value = None
-    if body.split_address:
-        if not valid_solana_address(body.split_address):
-            raise HTTPException(400, "Invalid split payout address")
-        if body.split_type not in ("percent", "fixed"):
-            raise HTTPException(400, "split_type must be 'percent' or 'fixed'")
-        if body.split_value is None or body.split_value <= 0:
-            raise HTTPException(400, "split_value must be > 0")
-        if body.split_type == "percent" and body.split_value >= 100:
-            raise HTTPException(400, "percent split must be < 100")
-        split_address = body.split_address
-        split_type = body.split_type
-        split_value = body.split_value
-
-    if body.branding is not None:
-        branding = clean_branding(body.branding)
-        m_updates = {"branding": branding}
-        if branding["name"]:
-            m_updates["business_name"] = branding["name"]
-        await db.merchants.update_one({"address": merchant["address"]}, {"$set": m_updates})
-    else:
-        branding = merchant.get("branding") or {}
-
-    priv = wots.generate_privkey()
-    merkle_root = wots.pubkey_merkle_root(priv)
-    vault_address, bump = sv.derive_vault(merkle_root)
-    amount_lamports = int(round(body.amount_sol * sv.LAMPORTS_PER_SOL))
-    usd = await fetch_sol_usd()
-    created = now()
-    inv = {
-        "id": str(uuid.uuid4()),
-        "merchant_address": merchant["address"],
-        "amount_sol": body.amount_sol,
-        "amount_lamports": amount_lamports,
-        "memo": (body.memo or "").strip(),
-        "status": "created",
-        "wots_privkey_enc": fernet.encrypt(priv).decode(),
-        "merkle_root_hex": merkle_root.hex(),
-        "vault_address": vault_address,
-        "bump": bump,
-        "open_tx_sig": None,
-        "close_tx_sig": None,
-        "observed_lamports": 0,
-        "rent_baseline": 0,
-        "key_used": False,
-        "usd_rate": usd,
-        "allow_tips": body.allow_tips,
-        "split_address": split_address,
-        "split_type": split_type,
-        "split_value": split_value,
-        "branding": branding,
-        "created_at": iso(created),
-        "expires_at": iso(created + timedelta(minutes=body.expiry_minutes)),
-        "paid_at": None,
-        "settled_at": None,
-    }
-    await db.invoices.insert_one(dict(inv))
-    return public_invoice(inv, merchant.get("business_name"))
-
-
-@api.get("/invoices")
-async def list_invoices(merchant: dict = Depends(current_merchant)):
-    docs = await db.invoices.find({"merchant_address": merchant["address"]}, {"_id": 0}).to_list(1000)
-    docs.sort(key=lambda d: d["created_at"], reverse=True)
-    return [public_invoice(d, merchant.get("business_name")) for d in docs]
-
-
-@api.get("/stats")
-async def stats(merchant: dict = Depends(current_merchant)):
-    docs = await db.invoices.find({"merchant_address": merchant["address"]}, {"_id": 0}).to_list(5000)
-    by_status = {}
-    settled_sol = 0.0
-    pending_sol = 0.0
-    for d in docs:
-        by_status[d["status"]] = by_status.get(d["status"], 0) + 1
-        if d["status"] == "settled":
-            settled_sol += d["amount_sol"]
-        elif d["status"] in ("paid", "overpaid", "active", "underpaid"):
-            pending_sol += d["amount_sol"]
+# ----------------------------- vault lifecycle -----------------------------
+@api.get("/vault")
+async def my_vault(user: dict = Depends(current_user)):
+    me = user["address"]
+    v = await get_vault(me)
+    if v and v["status"] == "open":
+        v = await refresh_balance(v)
+    pending = await db.transfers.find_one({"sender": me, "status": "pending"}, {"_id": 0})
+    undelivered = await db.transfers.find_one({"sender": me, "status": "completed", "route": "wallet",
+                                               "delivered": False}, {"_id": 0})
+    agg = await db.transfers.find({"$or": [{"sender": me}, {"recipient_owner": me}], "status": "completed"},
+                                  {"_id": 0, "kind": 1, "sender": 1, "recipient_owner": 1,
+                                   "amount_lamports": 1}).to_list(5000)
+    sent = sum(t["amount_lamports"] for t in agg if t.get("sender") == me and t["kind"] == "send")
+    received = sum(t["amount_lamports"] for t in agg if t.get("recipient_owner") == me and t.get("sender") != me
+                   and t["kind"] in ("send", "deposit"))
     return {
-        "total_invoices": len(docs),
-        "by_status": by_status,
-        "settled_sol": round(settled_sol, 6),
-        "pending_sol": round(pending_sol, 6),
+        "vault": public_vault(v),
+        "pending_transfer": public_transfer(pending, me) if pending else None,
+        "undelivered_transfer": public_transfer(undelivered, me) if undelivered else None,
+        "usd_rate": await fetch_sol_usd(),
+        "stats": {"sent_sol": sent / LPS, "received_sol": received / LPS, "rotations": (v or {}).get("nonce", 0)},
+        "token_rent_lamports": RENT["token"],
+        "vault_rent_lamports": RENT["vault"],
     }
 
 
-async def _get_owned_invoice(invoice_id: str, merchant: dict) -> dict:
-    inv = await db.invoices.find_one({"id": invoice_id, "merchant_address": merchant["address"]}, {"_id": 0})
-    if not inv:
-        raise HTTPException(404, "Invoice not found")
-    return inv
+@api.get("/vault/keys")
+async def key_chain(user: dict = Depends(current_user)):
+    """The one-time key chain: every retired key + the live one."""
+    v = await get_vault(user["address"])
+    if not v:
+        return []
+    docs = await db.vault_keys.find({"vault_id": v["id"]}, {"_id": 0}).sort("nonce", -1).to_list(500)
+    live = {"nonce": v.get("nonce", 0), "pk_hash": v["pk_hex"], "status": "live", "tx_sig": None,
+            "explorer": None, "retired_at": None}
+    return [live] + [{**d, "status": "retired", "explorer": explorer_tx(d.get("tx_sig"))} for d in docs]
 
 
-@api.get("/invoices/{invoice_id}")
-async def get_invoice(invoice_id: str, merchant: dict = Depends(current_merchant)):
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    return public_invoice(inv, merchant.get("business_name"))
+class CreateIn(BaseModel):
+    deposit_sol: Optional[float] = Field(default=None, ge=0)
 
 
-@api.get("/invoices/{invoice_id}/open-tx")
-async def open_tx(invoice_id: str, merchant: dict = Depends(current_merchant)):
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    if inv["status"] not in ("created",):
-        raise HTTPException(400, f"Vault already activated (status={inv['status']})")
-    merkle_root = bytes.fromhex(inv["merkle_root_hex"])
-    ix = sv.open_vault_instruction(merkle_root, inv["bump"], merchant["address"], inv["vault_address"])
-    return {
-        "instruction": ix,
-        "fee_payer": merchant["address"],
-        "rent_lamports": sv.VAULT_RENT_LAMPORTS,
-        "vault_address": inv["vault_address"],
-    }
+@api.post("/vault/create")
+async def create_vault(body: CreateIn, user: dict = Depends(current_user)):
+    me = user["address"]
+    v = await get_vault(me)
+    if v and v["status"] == "open":
+        raise HTTPException(400, "You already have an open quantum vault")
+    if not v:
+        seed = wntr.new_seed()
+        pkh = wntr.public_key_hash(seed)
+        address, bump = sv.derive_vault(pkh)
+        v = {"id": str(uuid.uuid4()), "owner": me, "address": address, "bump": bump,
+             "vault_id_hex": pkh.hex(), "pk_hex": pkh.hex(), "seed_enc": enc(seed), "nonce": 0,
+             "ata": sv.derive_ata(address), "status": "created", "lamports": 0,
+             "exposed_nonce": None, "created_at": iso(now())}
+        await db.vaults.insert_one(dict(v))
+    ixs = [sv.initialize_ix(me, v["address"], bytes.fromhex(v["vault_id_hex"])),
+           sv.create_ata_idempotent_ix(me, v["address"])]
+    dep = int(round((body.deposit_sol or 0) * LPS))
+    if dep > 0:
+        ixs += [sv.system_transfer_ix(me, v["ata"], dep), sv.sync_native_ix(v["ata"])]
+    return {"vault": public_vault(v), "ixs": ixs, "fee_payer": me,
+            "cost_lamports": RENT["vault"] + RENT["token"], "deposit_lamports": dep}
 
 
 class SigIn(BaseModel):
     signature: str
 
 
-@api.post("/invoices/{invoice_id}/confirm-open")
-async def confirm_open(invoice_id: str, body: SigIn, merchant: dict = Depends(current_merchant)):
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    if inv["status"] != "created":
-        raise HTTPException(400, f"Vault already activated (status={inv['status']})")
-    await db.invoices.update_one(
-        {"id": invoice_id},
-        {"$set": {"status": "active", "open_tx_sig": body.signature, "rent_baseline": sv.VAULT_RENT_LAMPORTS}},
-    )
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    return public_invoice(inv, merchant.get("business_name"))
+@api.post("/vault/confirm-open")
+async def confirm_open(body: SigIn, user: dict = Depends(current_user)):
+    v = await get_vault(user["address"])
+    if not v:
+        raise HTTPException(404, "No vault to confirm")
+    if v["status"] == "open":
+        return public_vault(v)
+    st = await read_vault_state(v["address"])
+    if not st:
+        raise HTTPException(409, "Vault not yet visible on-chain — retry in a few seconds")
+    if st["vault_id"].hex() != v["vault_id_hex"] or st["pk_hash"].hex() != v["pk_hex"]:
+        raise HTTPException(409, "On-chain vault does not match this key — contact support")
+    lam, reserve = await ata_info(v["ata"])
+    await db.vaults.update_one({"id": v["id"]}, {"$set": {
+        "status": "open", "open_tx_sig": body.signature, "opened_at": iso(now()),
+        "lamports": lam, "reserve": reserve, "nonce": st["nonce"]}})
+    if spendable_of(lam, reserve) > 0:
+        await db.transfers.insert_one({
+            "id": str(uuid.uuid4()), "kind": "deposit", "sender": user["address"],
+            "recipient_owner": user["address"], "to_vault_id": v["id"], "dest_token": v["ata"],
+            "amount_lamports": spendable_of(lam, reserve), "tx_sig": body.signature, "status": "completed",
+            "created_at": iso(now()), "completed_at": iso(now()),
+        })
+    return public_vault(await get_vault(user["address"]))
 
 
-async def _refresh_payment(inv: dict) -> dict:
-    """Query on-chain balance and transition status accordingly."""
-    if inv["status"] in ("settled",):
-        return inv
-    try:
-        balance = await get_balance(inv["vault_address"])
-    except Exception as e:
-        logger.warning(f"balance check failed for {inv['vault_address']}: {e}")
-        return inv
-
-    updates = {"observed_lamports": balance}
-    baseline = inv.get("rent_baseline") or 0
-    received = max(0, balance - baseline)
-    expired = now() > datetime.fromisoformat(inv["expires_at"])
-
-    new_status = inv["status"]
-    if inv["status"] in ("active", "created", "underpaid"):
-        if received >= inv["amount_lamports"] and inv["amount_lamports"] > 0:
-            new_status = "overpaid" if received > inv["amount_lamports"] else "paid"
-            if not inv.get("paid_at"):
-                updates["paid_at"] = iso(now())
-        elif received > 0:
-            new_status = "underpaid"
-        elif expired:
-            new_status = "expired"
-    updates["status"] = new_status
-    await db.invoices.update_one({"id": inv["id"]}, {"$set": updates})
-    inv = {**inv, **updates}
-    return inv
+# ----------------------------- recipients -----------------------------
+async def resolve_recipient(address: str) -> dict:
+    if not valid_solana_address(address):
+        raise HTTPException(400, "Invalid Solana address")
+    owner = await db.users.find_one({"address": address}, {"_id": 0})
+    v = await get_vault(address) if owner else None
+    if v and v["status"] == "open":
+        return {"kind": "vault", "registered": True, "owner": address, "vault_address": v["address"],
+                "token_account": v["ata"], "vault_db_id": v["id"]}
+    return {"kind": "wallet", "registered": bool(owner), "owner": None, "vault_address": None,
+            "token_account": None, "vault_db_id": None}
 
 
-@api.post("/invoices/{invoice_id}/check-payment")
-async def check_payment(invoice_id: str, merchant: dict = Depends(current_merchant)):
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    inv = await _refresh_payment(inv)
-    return public_invoice(inv, merchant.get("business_name"))
+@api.get("/resolve/{address}")
+async def resolve_endpoint(address: str):
+    r = await resolve_recipient(address)
+    return {k: r[k] for k in ("kind", "registered", "vault_address")}
 
 
-@api.get("/invoices/{invoice_id}/settle-tx")
-async def settle_tx(invoice_id: str, merchant: dict = Depends(current_merchant)):
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    if inv.get("key_used") or inv["status"] == "settled":
-        raise HTTPException(400, "This vault's one-time key has already been used (settled).")
-    if inv["status"] not in ("paid", "overpaid", "active", "underpaid"):
-        raise HTTPException(400, f"Vault not ready to settle (status={inv['status']}).")
-    payout = merchant["payout_address"]
-    priv = fernet.decrypt(inv["wots_privkey_enc"].encode())
-
-    # Refresh balance so a percentage split reflects the latest received amount.
-    try:
-        balance = await get_balance(inv["vault_address"])
-    except Exception:
-        balance = inv.get("observed_lamports") or 0
-    baseline = inv.get("rent_baseline") or 0
-    received = max(0, balance - baseline)
-
-    split_address = inv.get("split_address")
-    if split_address:
-        # Compute the split recipient's share (in lamports) from the received amount.
-        if inv.get("split_type") == "percent":
-            split_lamports = int(round((inv["split_value"] / 100.0) * received))
-        else:  # fixed SOL amount
-            split_lamports = int(round(inv["split_value"] * sv.LAMPORTS_PER_SOL))
-        split_lamports = max(0, min(split_lamports, received))
-        message = sv.split_message(split_lamports, split_address, payout)
-        signature = wots.sign(priv, message)
-        if wots.recover_merkle_root(signature, message).hex() != inv["merkle_root_hex"]:
-            raise HTTPException(500, "Signature self-verification failed")
-        ix = sv.split_vault_instruction(signature, split_lamports, inv["bump"],
-                                        inv["vault_address"], split_address, payout)
-        return {
-            "instruction": ix,
-            "fee_payer": payout,
-            "payout_address": payout,
-            "vault_address": inv["vault_address"],
-            "mode": "split",
-            "split_address": split_address,
-            "split_lamports": split_lamports,
-            "split_sol": split_lamports / sv.LAMPORTS_PER_SOL,
-            "refund_sol": max(0, received - split_lamports) / sv.LAMPORTS_PER_SOL,
-        }
-
-    refund_pubkey_bytes = bytes(Pubkey.from_string(payout))
-    signature = wots.sign(priv, refund_pubkey_bytes)
-    # Safety: verify the signature recovers to the vault's committed merkle root
-    if wots.recover_merkle_root(signature, refund_pubkey_bytes).hex() != inv["merkle_root_hex"]:
-        raise HTTPException(500, "Signature self-verification failed")
-    ix = sv.close_vault_instruction(signature, inv["bump"], inv["vault_address"], payout)
+# ----------------------------- transfers -----------------------------
+def public_transfer(t: dict, viewer: Optional[str] = None) -> dict:
+    direction = None
+    if viewer:
+        if t["kind"] == "deposit":
+            direction = "in"
+        elif t.get("sender") == viewer and (t.get("recipient_owner") == viewer or t["kind"] in ("withdraw", "withdraw_all")):
+            direction = "self"
+        elif t.get("sender") == viewer:
+            direction = "out"
+        else:
+            direction = "in"
     return {
-        "instruction": ix,
-        "fee_payer": payout,
-        "payout_address": payout,
-        "vault_address": inv["vault_address"],
-        "mode": "close",
+        "id": t["id"],
+        "kind": t["kind"],                         # send | withdraw | withdraw_all | deposit
+        "route": t.get("route"),                   # vault | wallet | close
+        "direction": direction,
+        "status": t["status"],                     # pending | completed | discarded
+        "delivered": t.get("delivered", True),
+        "sender": t.get("sender"),
+        "to_address": t.get("to_address"),
+        "recipient_owner": t.get("recipient_owner"),
+        "amount_lamports": t.get("amount_lamports", 0),
+        "amount_sol": t.get("amount_lamports", 0) / LPS,
+        "nonce": t.get("nonce"),
+        "next_pk_hash": t.get("next_pk_hex"),
+        "tx_sig": t.get("tx_sig"),
+        "deliver_sig": t.get("deliver_sig"),
+        "explorer": explorer_tx(t.get("tx_sig")),
+        "explorer_deliver": explorer_tx(t.get("deliver_sig")),
+        "memo": t.get("memo", ""),
+        "created_at": t["created_at"],
+        "completed_at": t.get("completed_at"),
     }
 
 
-@api.post("/invoices/{invoice_id}/confirm-settle")
-async def confirm_settle(invoice_id: str, body: SigIn, merchant: dict = Depends(current_merchant)):
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    if inv.get("key_used"):
-        raise HTTPException(400, "Key already retired.")
-    await db.invoices.update_one(
-        {"id": invoice_id},
-        {"$set": {"status": "settled", "close_tx_sig": body.signature,
-                  "key_used": True, "settled_at": iso(now())}},
-    )
-    inv = await _get_owned_invoice(invoice_id, merchant)
-    return public_invoice(inv, merchant.get("business_name"))
+def deliver_ixs(t: dict) -> list:
+    """Ed25519 step for wallet-route transfers: unwrap the sender's wSOL ATA, forward native SOL."""
+    me = t["sender"]
+    ixs = [sv.token_close_ix(sv.derive_ata(me), me, me)]
+    if t["to_address"] != me:
+        ixs.append(sv.system_transfer_ix(me, t["to_address"], t["amount_lamports"]))
+    return ixs
 
 
-@api.get("/invoices/export/csv")
-async def export_csv(merchant: dict = Depends(current_merchant)):
-    docs = await db.invoices.find({"merchant_address": merchant["address"]}, {"_id": 0}).to_list(5000)
-    docs.sort(key=lambda d: d["created_at"], reverse=True)
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["Invoice ID", "Created", "Amount SOL", "Memo", "Status", "Vault Address",
-                "Received SOL", "Open Tx", "Settle Tx", "Settled At"])
-    for d in docs:
-        received = max(0, (d.get("observed_lamports") or 0) - (d.get("rent_baseline") or 0)) / sv.LAMPORTS_PER_SOL
-        w.writerow([d["id"], d["created_at"], d["amount_sol"], d.get("memo", ""), d["status"],
-                    d["vault_address"], received, d.get("open_tx_sig") or "",
-                    d.get("close_tx_sig") or "", d.get("settled_at") or ""])
-    return PlainTextResponse(buf.getvalue(), media_type="text/csv",
-                             headers={"Content-Disposition": "attachment; filename=quantumpos_invoices.csv"})
+async def build_bundle(t: dict) -> dict:
+    """Ordered transaction steps for the client. The WOTS signature is fixed for this nonce — retries
+    reuse it byte-for-byte, so resubmitting never reveals more of the key."""
+    v = await db.vaults.find_one({"id": t["from_vault_id"]}, {"_id": 0})
+    me = t["sender"]
+    sig = bytes.fromhex(t["sig_hex"])
+    npk = bytes.fromhex(t["next_pk_hex"])
+    steps = []
+    if t["route"] == "close":
+        main = sv.vault_execute_close_ix(v["address"], v["ata"], me, npk, sig)
+    else:
+        dest_owner = t["dest_owner"]
+        steps.append({"name": "prepare", "label": "Ensure destination token account",
+                      "ixs": [sv.create_ata_idempotent_ix(me, dest_owner)], "cu_limit": None})
+        main = sv.vault_transfer_ix(v["address"], v["ata"], t["dest_token"], t["amount_lamports"], npk, sig)
+    steps.append({"name": "sign", "label": "Winternitz-signed spend + key rotation",
+                  "ixs": [sv.sync_native_ix(v["ata"]), main], "cu_limit": CU_LIMIT,
+                  "cu_price": CU_PRICE_MICROLAMPORTS})
+    if t["route"] == "wallet":
+        steps.append({"name": "deliver", "label": "Unwrap and deliver native SOL",
+                      "ixs": deliver_ixs(t), "cu_limit": None})
+    return {"transfer": public_transfer(t, me), "fee_payer": me, "program_id": PROGRAM_ID,
+            "vault_address": v["address"], "nonce": t["nonce"], "steps": steps}
 
 
-# ----------------------------- public checkout -----------------------------
-@api.get("/checkout/{invoice_id}")
-async def checkout_view(invoice_id: str):
-    inv = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
-    if not inv:
-        raise HTTPException(404, "Invoice not found")
-    merchant = await db.merchants.find_one({"address": inv["merchant_address"]}, {"_id": 0})
-    name = (merchant or {}).get("business_name") or "Merchant"
-    return public_invoice(inv, name)
+class PrepareIn(BaseModel):
+    to: Optional[str] = None
+    amount_sol: Optional[float] = Field(default=None, gt=0)
+    mode: str = "send"                      # send | withdraw_all
+    memo: Optional[str] = ""
+    acknowledge_key_reuse: bool = False
 
 
-@api.post("/checkout/{invoice_id}/check")
-async def checkout_check(invoice_id: str):
-    inv = await db.invoices.find_one({"id": invoice_id}, {"_id": 0})
-    if not inv:
-        raise HTTPException(404, "Invoice not found")
-    inv = await _refresh_payment(inv)
-    merchant = await db.merchants.find_one({"address": inv["merchant_address"]}, {"_id": 0})
-    name = (merchant or {}).get("business_name") or "Merchant"
-    return public_invoice(inv, name)
+async def _sync_vault_with_chain(v: dict) -> tuple:
+    """Return (vault_doc, on-chain state); reconciles a landed pending transfer if needed."""
+    st = await read_vault_state(v["address"])
+    if not st:
+        raise HTTPException(502, "Could not read the vault account on-chain")
+    if st["nonce"] != v.get("nonce", 0) or st["pk_hash"].hex() != v["pk_hex"]:
+        for t in await db.transfers.find({"from_vault_id": v["id"], "status": "pending"}, {"_id": 0}).to_list(5):
+            await finalize_if_landed(t)
+        v = await db.vaults.find_one({"id": v["id"]}, {"_id": 0})
+        if st["nonce"] != v.get("nonce", 0) or st["pk_hash"].hex() != v["pk_hex"]:
+            raise HTTPException(500, "Vault key state is out of sync with the chain")
+    return v, st
+
+
+@api.post("/transfers/prepare")
+async def prepare_transfer(body: PrepareIn, user: dict = Depends(current_user)):
+    me = user["address"]
+    v = await get_vault(me)
+    if not v or v["status"] != "open":
+        raise HTTPException(400, "Open your quantum vault first")
+    if await db.transfers.find_one({"from_vault_id": v["id"], "status": "pending"}):
+        raise HTTPException(409, "You have a signed transfer waiting — finish or discard it first")
+    v, st = await _sync_vault_with_chain(v)
+    if v.get("exposed_nonce") == v["nonce"] and not body.acknowledge_key_reuse:
+        raise HTTPException(428, "Your current one-time key already signed a transfer you discarded. "
+                                 "Signing a different message with it weakens its quantum security. "
+                                 "Confirm to proceed — we recommend moving funds immediately.")
+    v = await refresh_balance(v)
+    lam = v["lamports"]
+    spendable = spendable_of(lam, v.get("reserve"))
+    nonce = st["nonce"]
+    vault_id = bytes.fromhex(v["vault_id_hex"])
+    seed = dec(v["seed_enc"])
+    nseed = wntr.new_seed()
+    npk = wntr.public_key_hash(nseed)
+
+    t = {"id": str(uuid.uuid4()), "sender": me, "from_vault_id": v["id"], "nonce": nonce,
+         "next_seed_enc": enc(nseed), "next_pk_hex": npk.hex(), "memo": (body.memo or "").strip()[:120],
+         "status": "pending", "created_at": iso(now())}
+
+    if body.mode == "withdraw_all":
+        if spendable <= 0 and lam <= 0:
+            raise HTTPException(400, "Nothing to withdraw")
+        metas = sv.close_inner_metas(v["address"], v["ata"], me)
+        digest = wntr.exec_digest(vault_id, nonce, bytes(sv.TOKEN_PROGRAM_ID), metas, bytes([9]), npk)
+        t.update(kind="withdraw_all", route="close", to_address=me, recipient_owner=me, dest_token=None,
+                 dest_owner=me, amount_lamports=lam, delivered=True)
+    elif body.mode == "send":
+        if not body.to or not body.amount_sol:
+            raise HTTPException(400, "Recipient address and amount are required")
+        to = body.to.strip()
+        if not valid_solana_address(to):
+            raise HTTPException(400, "Invalid Solana address")
+        if to in (v["address"], v["ata"]):
+            raise HTTPException(400, "That is your own vault")
+        amount = int(round(body.amount_sol * LPS))
+        if amount > spendable:
+            raise HTTPException(400, f"Insufficient vault balance — spendable {spendable / LPS:.6f} SOL")
+        r = {"kind": "wallet"} if to == me else await resolve_recipient(to)
+        if r["kind"] == "vault":
+            t.update(kind="send", route="vault", to_address=to, recipient_owner=to,
+                     to_vault_id=r["vault_db_id"], dest_owner=r["vault_address"], dest_token=r["token_account"],
+                     amount_lamports=amount, delivered=True)
+        else:
+            if to != me:
+                acc = await get_account(to)
+                if acc and acc.get("owner") != SYSTEM_OWNER:
+                    raise HTTPException(400, "Recipient is not a regular wallet address")
+                if (not acc or not acc.get("lamports")) and amount < RENT["wallet"]:
+                    raise HTTPException(400, f"First transfer to an empty wallet must be at least "
+                                             f"{RENT['wallet'] / LPS:.6f} SOL (Solana rent minimum)")
+            # wSOL leaves the vault into the sender's own wSOL account, then is unwrapped + forwarded.
+            t.update(kind="withdraw" if to == me else "send", route="wallet", to_address=to,
+                     recipient_owner=me if to == me else None, dest_owner=me, dest_token=sv.derive_ata(me),
+                     amount_lamports=amount, delivered=False)
+        digest = wntr.xfer_digest(vault_id, nonce, bytes(Pubkey.from_string(v["ata"])),
+                                  bytes(Pubkey.from_string(t["dest_token"])), amount, npk)
+    else:
+        raise HTTPException(400, "mode must be 'send' or 'withdraw_all'")
+
+    sig = wntr.sign(seed, digest)
+    if not wntr.verify(st["pk_hash"], digest, sig):
+        raise HTTPException(500, "WOTS signature self-verification failed")
+    t["sig_hex"] = sig.hex()
+    t["digest_hex"] = digest.hex()
+    await db.transfers.insert_one(dict(t))
+    return await build_bundle(t)
+
+
+async def _owned_transfer(tid: str, me: str) -> dict:
+    t = await db.transfers.find_one({"id": tid, "sender": me}, {"_id": 0})
+    if not t:
+        raise HTTPException(404, "Transfer not found")
+    return t
+
+
+@api.get("/transfers/pending")
+async def pending_transfer(user: dict = Depends(current_user)):
+    t = await db.transfers.find_one({"sender": user["address"], "status": "pending"}, {"_id": 0})
+    return {"pending": await build_bundle(t) if t else None}
+
+
+async def finalize_if_landed(t: dict, tx_sig: Optional[str] = None) -> Optional[dict]:
+    """Deterministic: the spend landed iff the on-chain vault nonce advanced to t.nonce+1 with
+    pk_hash == t.next_pk. Then the server's live key becomes the next seed."""
+    v = await db.vaults.find_one({"id": t["from_vault_id"]}, {"_id": 0})
+    st = await read_vault_state(v["address"])
+    if not st or st["nonce"] <= t["nonce"]:
+        return None
+    if st["nonce"] != t["nonce"] + 1 or st["pk_hash"].hex() != t["next_pk_hex"]:
+        logger.error(f"vault {v['address']} advanced unexpectedly (nonce {st['nonce']}) for transfer {t['id']}")
+        return None
+    if v.get("nonce") == t["nonce"]:
+        res = await db.vaults.update_one({"id": v["id"], "nonce": t["nonce"]}, {"$set": {
+            "seed_enc": t["next_seed_enc"], "pk_hex": t["next_pk_hex"], "nonce": t["nonce"] + 1}})
+        if res.modified_count:
+            await db.vault_keys.insert_one({"vault_id": v["id"], "nonce": t["nonce"], "pk_hash": v["pk_hex"],
+                                            "tx_sig": tx_sig, "transfer_id": t["id"], "retired_at": iso(now())})
+    await refresh_balance(await db.vaults.find_one({"id": v["id"]}, {"_id": 0}))
+    if t.get("to_vault_id"):
+        rv = await db.vaults.find_one({"id": t["to_vault_id"]}, {"_id": 0})
+        if rv:
+            await refresh_balance(rv)
+    upd = {"status": "completed", "completed_at": iso(now())}
+    if tx_sig:
+        upd["tx_sig"] = tx_sig
+    await db.transfers.update_one({"id": t["id"], "status": "pending"}, {"$set": upd})
+    return await db.transfers.find_one({"id": t["id"]}, {"_id": 0})
+
+
+@api.post("/transfers/{tid}/confirm")
+async def confirm_transfer(tid: str, body: SigIn, user: dict = Depends(current_user)):
+    t = await _owned_transfer(tid, user["address"])
+    if t["status"] == "completed":
+        if body.signature and not t.get("tx_sig"):
+            await db.transfers.update_one({"id": tid}, {"$set": {"tx_sig": body.signature}})
+        return public_transfer(await _owned_transfer(tid, user["address"]), user["address"])
+    if t["status"] == "discarded":
+        raise HTTPException(400, "Transfer was discarded")
+    st = await rpc_call("getSignatureStatuses", [[body.signature], {"searchTransactionHistory": True}])
+    s = (st.get("value") or [None])[0]
+    if s and s.get("err"):
+        raise HTTPException(400, f"Transaction failed on-chain: {s['err']}")
+    done = await finalize_if_landed(t, body.signature)
+    if not done:
+        raise HTTPException(409, "Not yet visible on-chain — retrying shortly")
+    return public_transfer(done, user["address"])
+
+
+@api.post("/transfers/{tid}/delivered")
+async def confirm_delivered(tid: str, body: SigIn, user: dict = Depends(current_user)):
+    t = await _owned_transfer(tid, user["address"])
+    if t.get("route") != "wallet" or t["status"] != "completed":
+        raise HTTPException(400, "Nothing to deliver for this transfer")
+    st = await rpc_call("getSignatureStatuses", [[body.signature], {"searchTransactionHistory": True}])
+    s = (st.get("value") or [None])[0]
+    if not s or s.get("err") or s.get("confirmationStatus") not in ("confirmed", "finalized"):
+        raise HTTPException(409, "Delivery transaction not confirmed yet")
+    await db.transfers.update_one({"id": tid}, {"$set": {"delivered": True, "deliver_sig": body.signature}})
+    return public_transfer(await _owned_transfer(tid, user["address"]), user["address"])
+
+
+@api.get("/transfers/{tid}/deliver-ixs")
+async def deliver_instructions(tid: str, user: dict = Depends(current_user)):
+    t = await _owned_transfer(tid, user["address"])
+    if t.get("route") != "wallet" or t["status"] != "completed" or t.get("delivered"):
+        raise HTTPException(400, "Nothing to deliver for this transfer")
+    return {"transfer": public_transfer(t, user["address"]), "fee_payer": user["address"],
+            "steps": [{"name": "deliver", "label": "Unwrap and deliver native SOL", "ixs": deliver_ixs(t),
+                       "cu_limit": None}]}
+
+
+@api.post("/transfers/{tid}/retry")
+async def retry_transfer(tid: str, user: dict = Depends(current_user)):
+    t = await _owned_transfer(tid, user["address"])
+    if t["status"] != "pending":
+        raise HTTPException(400, f"Transfer is {t['status']}")
+    if await finalize_if_landed(t):
+        raise HTTPException(409, "This transfer already landed on-chain — it is now marked completed")
+    return await build_bundle(t)
+
+
+@api.post("/transfers/{tid}/discard")
+async def discard_transfer(tid: str, user: dict = Depends(current_user)):
+    t = await _owned_transfer(tid, user["address"])
+    if t["status"] != "pending":
+        raise HTTPException(400, f"Transfer is {t['status']}")
+    if await finalize_if_landed(t):
+        raise HTTPException(409, "This transfer already landed on-chain — it can't be discarded")
+    await db.transfers.update_one({"id": tid}, {"$set": {"status": "discarded", "discarded_at": iso(now())}})
+    # The signature may have been broadcast in a failed tx -> treat this nonce's key as exposed.
+    await db.vaults.update_one({"id": t["from_vault_id"]}, {"$set": {"exposed_nonce": t["nonce"]}})
+    return {"ok": True}
+
+
+@api.get("/activity")
+async def activity(user: dict = Depends(current_user)):
+    me = user["address"]
+    docs = await db.transfers.find({"$or": [{"sender": me}, {"recipient_owner": me}],
+                                    "status": {"$in": ["completed", "pending"]}},
+                                   {"_id": 0}).sort("created_at", -1).to_list(300)
+    return [public_transfer(d, me) for d in docs if d.get("sender") == me or d["status"] == "completed"]
+
+
+# ----------------------------- public pay / deposits -----------------------------
+@api.get("/pay/{address}")
+async def pay_info(address: str):
+    if not valid_solana_address(address):
+        raise HTTPException(400, "Invalid Solana address")
+    owner = await db.users.find_one({"address": address}, {"_id": 0})
+    v = await get_vault(address) if owner else None
+    has_vault = bool(v and v["status"] == "open")
+    return {"address": address, "registered": bool(owner), "has_vault": has_vault,
+            "vault_address": v["address"] if has_vault else None,
+            "token_account": v["ata"] if has_vault else None,
+            "nonce": v.get("nonce") if has_vault else None,
+            "usd_rate": await fetch_sol_usd()}
+
+
+class DepositIxIn(BaseModel):
+    payer: str
+    amount_sol: float = Field(gt=0)
+
+
+@api.post("/pay/{address}/deposit-ixs")
+async def deposit_ixs(address: str, body: DepositIxIn):
+    """Instructions for any Phantom user to deposit into `address`'s vault: create the vault's wSOL
+    account if needed, transfer SOL into it, sync. Plain SOL never touches the vault PDA itself."""
+    if not valid_solana_address(address) or not valid_solana_address(body.payer):
+        raise HTTPException(400, "Invalid Solana address")
+    v = await get_vault(address)
+    if not v or v["status"] != "open":
+        raise HTTPException(404, "This address has no open quantum vault")
+    lam = int(round(body.amount_sol * LPS))
+    return {"fee_payer": body.payer, "vault_address": v["address"], "token_account": v["ata"],
+            "amount_lamports": lam,
+            "ixs": [sv.create_ata_idempotent_ix(body.payer, v["address"]),
+                    sv.system_transfer_ix(body.payer, v["ata"], lam), sv.sync_native_ix(v["ata"])]}
+
+
+class DepositIn(BaseModel):
+    signature: str
+    memo: Optional[str] = ""
+
+
+@api.post("/deposits/record")
+async def record_deposit(body: DepositIn):
+    """Attribute a deposit by reading the confirmed transaction's balance changes on vault token accounts."""
+    if await db.transfers.find_one({"kind": "deposit", "tx_sig": body.signature}):
+        return {"ok": True, "duplicate": True}
+    tx = None
+    for _ in range(4):
+        tx = await rpc_call("getTransaction", [body.signature, {"encoding": "json", "commitment": "confirmed",
+                                                                "maxSupportedTransactionVersion": 0}])
+        if tx:
+            break
+        await asyncio.sleep(2)
+    if not tx:
+        raise HTTPException(404, "Transaction not found yet")
+    if (tx.get("meta") or {}).get("err"):
+        raise HTTPException(400, "Transaction failed on-chain")
+    keys = tx["transaction"]["message"]["accountKeys"]
+    keys = [k if isinstance(k, str) else k.get("pubkey") for k in keys]
+    pre, post = tx["meta"]["preBalances"], tx["meta"]["postBalances"]
+    recorded = []
+    for i, k in enumerate(keys):
+        v = await db.vaults.find_one({"ata": k, "status": "open"}, {"_id": 0})
+        if not v:
+            continue
+        delta = post[i] - pre[i]
+        if pre[i] == 0:
+            delta -= (await ata_info(k))[1] or RENT["token"]  # account created in this tx; rent isn't a deposit
+        if delta <= 0:
+            continue
+        anon = await db.transfers.find_one({"kind": "deposit", "to_vault_id": v["id"], "tx_sig": None,
+                                            "amount_lamports": delta}, {"_id": 0})
+        if anon:
+            await db.transfers.update_one({"id": anon["id"]}, {"$set": {
+                "tx_sig": body.signature, "sender": keys[0], "memo": (body.memo or "")[:120]}})
+        else:
+            await db.transfers.insert_one({
+                "id": str(uuid.uuid4()), "kind": "deposit", "sender": keys[0], "recipient_owner": v["owner"],
+                "to_vault_id": v["id"], "dest_token": v["ata"], "amount_lamports": delta,
+                "tx_sig": body.signature, "memo": (body.memo or "")[:120], "status": "completed",
+                "created_at": iso(now()), "completed_at": iso(now()),
+            })
+            await refresh_balance(v)
+        recorded.append({"vault": v["address"], "amount_sol": delta / LPS})
+    return {"ok": True, "recorded": recorded}
+
+
+# ----------------------------- misc -----------------------------
+@api.get("/price")
+async def price():
+    return {"sol_usd": await fetch_sol_usd()}
 
 
 RPC_PROXY_METHODS = {
@@ -681,28 +867,62 @@ async def config():
     return {
         "cluster": CLUSTER,
         "rpc_url": RPC_URL,
-        "program_id": os.environ["VAULT_PROGRAM_ID"],
-        "explorer_program": explorer_address(os.environ["VAULT_PROGRAM_ID"]),
-        "rent_lamports": sv.VAULT_RENT_LAMPORTS,
+        "program_id": PROGRAM_ID,
+        "explorer_program": explorer_address(PROGRAM_ID),
+        "program_source": "https://github.com/rabb757/winternitz-vault",
+        "vault_rent_lamports": RENT["vault"],
+        "token_rent_lamports": RENT["token"],
+        "wallet_rent_lamports": RENT["wallet"],
+        "cu_limit": CU_LIMIT,
+        "cu_price_microlamports": CU_PRICE_MICROLAMPORTS,
+        "wots": {"n": wntr.N, "chains": wntr.CHUNKS, "sig_len": wntr.SIG_LEN, "checksum_chunks": wntr.SUM_CHUNKS},
     }
 
 
 @api.get("/")
 async def root():
-    return {"service": "QuantumPOS", "status": "ok", "cluster": CLUSTER}
+    return {"service": "QuantumPOS transaction layer", "status": "ok", "cluster": CLUSTER}
 
 
 # ----------------------------- background watcher -----------------------------
+async def watcher_tick():
+    # 1) reconcile signed transfers that landed (deterministic nonce check)
+    for t in await db.transfers.find({"status": "pending"}, {"_id": 0}).to_list(200):
+        try:
+            await finalize_if_landed(t)
+        except Exception as e:
+            logger.warning(f"watcher transfer {t['id']}: {e}")
+        await asyncio.sleep(0.5)
+    # 2) detect outside deposits into vault token accounts
+    for v in await db.vaults.find({"status": "open"}, {"_id": 0}).to_list(500):
+        try:
+            busy = await db.transfers.find_one({"status": "pending", "$or": [
+                {"from_vault_id": v["id"]}, {"dest_token": v["ata"]}]})
+            if busy:
+                continue  # in-app transfer in flight; finalize_if_landed reconciles the balance
+            bal, reserve = await ata_info(v["ata"])
+            prev = v.get("lamports") or 0
+            delta = bal - prev
+            if prev == 0 and bal > 0:
+                delta = bal - reserve  # account (re)created; its rent isn't a deposit
+            if delta > 0:
+                await db.transfers.insert_one({
+                    "id": str(uuid.uuid4()), "kind": "deposit", "sender": None, "recipient_owner": v["owner"],
+                    "to_vault_id": v["id"], "dest_token": v["ata"], "amount_lamports": delta, "tx_sig": None,
+                    "status": "completed", "created_at": iso(now()), "completed_at": iso(now()),
+                })
+            if bal != prev:
+                await db.vaults.update_one({"id": v["id"]}, {"$set": {"lamports": bal, **({"reserve": reserve} if bal else {})}})
+        except Exception as e:
+            logger.warning(f"watcher vault {v['address']}: {e}")
+        await asyncio.sleep(1.0)
+
+
 async def watcher_loop():
     await asyncio.sleep(10)
     while True:
         try:
-            docs = await db.invoices.find(
-                {"status": {"$in": ["active", "created", "underpaid"]}}, {"_id": 0}
-            ).to_list(200)
-            for d in docs:
-                await _refresh_payment(d)
-                await asyncio.sleep(1.5)  # be gentle with public RPC
+            await watcher_tick()
         except Exception as e:
             logger.warning(f"watcher error: {e}")
         await asyncio.sleep(30)
@@ -721,8 +941,18 @@ app.add_middleware(
 @app.on_event("startup")
 async def _startup():
     await db.challenges.create_index("expires_at", expireAfterSeconds=0)
+    await db.vaults.create_index("owner", unique=True)
+    await db.vaults.create_index("ata")
+    await db.transfers.create_index("sender")
+    await db.transfers.create_index("recipient_owner")
+    for key, size in (("wallet", 0), ("vault", sv.VAULT_LEN), ("token", 165)):
+        try:
+            RENT[key] = await rpc_call("getMinimumBalanceForRentExemption", [size])
+        except Exception as e:
+            logger.warning(f"rent fetch failed ({key}): {e}")
+    logger.info(f"rent-exempt minimums: {RENT}")
     asyncio.create_task(watcher_loop())
-    logger.info(f"QuantumPOS started on cluster={CLUSTER}")
+    logger.info(f"QuantumPOS transaction layer started on cluster={CLUSTER}")
 
 
 @app.on_event("shutdown")

@@ -5,8 +5,9 @@ import { AuthProvider, useAuth } from "@/context/AuthContext";
 import api from "@/lib/api";
 import { initConnection } from "@/lib/solanaClient";
 import Landing from "@/pages/Landing";
-import Dashboard from "@/pages/Dashboard";
-import Checkout from "@/pages/Checkout";
+import Wallet from "@/pages/Wallet";
+import Pay from "@/pages/Pay";
+import Docs from "@/pages/Docs";
 import "@/App.css";
 
 export const ConfigContext = { current: null };
@@ -17,7 +18,7 @@ function Gate({ children }) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-quantum-ink">
         <div className="font-plex-mono text-sm text-quantum-green">
-          booting quantum_pos<span className="cursor-blink">▊</span>
+          booting quantum_layer<span className="cursor-blink">▊</span>
         </div>
       </div>
     );
@@ -26,7 +27,7 @@ function Gate({ children }) {
 }
 
 function App() {
-  const [ready, setReady] = useState(false);
+  const [, setReady] = useState(false);
   useEffect(() => {
     api.get("/config").then(({ data }) => {
       ConfigContext.current = data;
@@ -41,9 +42,11 @@ function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/" element={<Gate><Landing /></Gate>} />
-            <Route path="/app" element={<Gate><Dashboard /></Gate>} />
+            <Route path="/app" element={<Gate><Wallet /></Gate>} />
             <Route path="/dashboard" element={<Navigate to="/app" replace />} />
-            <Route path="/pay/:id" element={<Checkout />} />
+            <Route path="/docs" element={<Docs />} />
+            <Route path="/pay/:address" element={<Pay />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </BrowserRouter>
       </AuthProvider>

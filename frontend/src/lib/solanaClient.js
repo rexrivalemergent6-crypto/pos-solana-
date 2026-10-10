@@ -3,14 +3,13 @@ import {
   PublicKey,
   Transaction,
   TransactionInstruction,
-  SystemProgram,
   ComputeBudgetProgram,
 } from "@solana/web3.js";
 import { getPhantom } from "./phantom";
 import { API } from "./api";
 
 // Browser -> our backend proxy -> Solana RPC. The public mainnet RPC rejects browser
-// origins with 403 "Access forbidden", so all reads go through /api/rpc.
+// origins with 403 "Access forbidden", so all reads/writes go through /api/rpc.
 const PROXY_RPC = `${API}/rpc`;
 let _conn = null;
 
@@ -46,7 +45,7 @@ async function confirmByPolling(conn, signature, lastValidBlockHeight, timeoutMs
   throw new Error("Timed out waiting for confirmation — check the explorer, then refresh");
 }
 
-function ixFromDescriptor(desc) {
+export function ixFromDescriptor(desc) {
   return new TransactionInstruction({
     programId: new PublicKey(desc.programId),
     keys: desc.keys.map((k) => ({
@@ -58,44 +57,80 @@ function ixFromDescriptor(desc) {
   });
 }
 
-async function buildAndSend(instructions, feePayer, computeUnits) {
-  const conn = getConnection();
-  const p = getPhantom();
-  if (!p) throw new Error("Phantom not found");
+function buildTx(step, feePayer, blockhash) {
   const tx = new Transaction();
-  if (computeUnits) {
-    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }));
-  }
-  instructions.forEach((ix) => tx.add(ix));
+  if (step.cu_limit) tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: step.cu_limit }));
+  if (step.cu_price) tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: step.cu_price }));
+  step.ixs.forEach((d) => tx.add(ixFromDescriptor(d)));
   tx.feePayer = new PublicKey(feePayer);
-  let blockhash, lastValidBlockHeight;
+  tx.recentBlockhash = blockhash;
+  return tx;
+}
+
+function walletError(e) {
+  if (e?.code === 4001) return new Error("Request rejected in Phantom");
+  return e;
+}
+
+async function latest(conn) {
   try {
-    ({ blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("confirmed"));
+    return await conn.getLatestBlockhash("confirmed");
   } catch (e) {
     throw new Error(`Could not reach Solana network: ${e?.message || e}`);
   }
-  tx.recentBlockhash = blockhash;
-  const { signature } = await p.signAndSendTransaction(tx);
+}
+
+/** One transaction, signed and sent by Phantom (vault open, deposits). */
+export async function sendSingle(ixs, feePayer, cuLimit = null) {
+  const conn = getConnection();
+  const p = getPhantom();
+  if (!p) throw new Error("Phantom not found");
+  const { blockhash, lastValidBlockHeight } = await latest(conn);
+  const tx = buildTx({ ixs, cu_limit: cuLimit }, feePayer, blockhash);
+  let signature;
+  try {
+    ({ signature } = await p.signAndSendTransaction(tx));
+  } catch (e) { throw walletError(e); }
   await confirmByPolling(conn, signature, lastValidBlockHeight);
   return signature;
 }
 
-// Merchant opens a vault (pays rent + fee). ~34-byte instruction.
-export async function sendOpenVault(descriptor, feePayer) {
-  return buildAndSend([ixFromDescriptor(descriptor.instruction)], feePayer, 200000);
-}
+/**
+ * Ordered multi-step bundle from the backend (prepare -> sign -> deliver).
+ * Phantom approves every step ONCE (signAllTransactions); steps are then broadcast strictly in
+ * order, each confirmed before the next, so the WOTS spend only lands after its destination exists.
+ */
+export async function executeSteps(steps, feePayer, onProgress = () => {}) {
+  const conn = getConnection();
+  const p = getPhantom();
+  if (!p) throw new Error("Phantom not found");
+  const { blockhash, lastValidBlockHeight } = await latest(conn);
+  const txs = steps.map((s) => buildTx(s, feePayer, blockhash));
+  onProgress({ phase: "approve" });
+  let signed;
+  try {
+    if (p.signAllTransactions) signed = await p.signAllTransactions(txs);
+    else { signed = []; for (const t of txs) signed.push(await p.signTransaction(t)); }
+  } catch (e) { throw walletError(e); }
 
-// Merchant closes a vault (one-time WOTS sig). Heavy keccak -> high CU limit.
-export async function sendCloseVault(descriptor, feePayer) {
-  return buildAndSend([ixFromDescriptor(descriptor.instruction)], feePayer, 1000000);
-}
-
-// Customer pays SOL to the vault address (plain system transfer).
-export async function sendPayment(fromPubkey, vaultAddress, lamports) {
-  const ix = SystemProgram.transfer({
-    fromPubkey: new PublicKey(fromPubkey),
-    toPubkey: new PublicKey(vaultAddress),
-    lamports,
-  });
-  return buildAndSend([ix], fromPubkey, null);
+  const sigs = {};
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    onProgress({ phase: "send", step: s.name, index: i });
+    let sig;
+    try {
+      sig = await conn.sendRawTransaction(signed[i].serialize(), { skipPreflight: false, preflightCommitment: "confirmed", maxRetries: 3 });
+    } catch (e) {
+      const err = new Error(`${s.label} failed: ${e?.message || e}`);
+      err.step = s.name; err.sigs = sigs; throw err;
+    }
+    try {
+      await confirmByPolling(conn, sig, lastValidBlockHeight);
+    } catch (e) {
+      e.step = s.name; e.sigs = { ...sigs, [s.name]: sig }; throw e;
+    }
+    sigs[s.name] = sig;
+    onProgress({ phase: "confirmed", step: s.name, index: i, signature: sig });
+  }
+  return sigs;
 }

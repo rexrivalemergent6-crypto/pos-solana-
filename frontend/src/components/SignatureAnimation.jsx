@@ -5,7 +5,7 @@ import { CheckCircle, Lightning } from "@phosphor-icons/react";
 const HEX = "0123456789abcdef";
 const randHex = (n) => Array.from({ length: n }, () => HEX[Math.floor(Math.random() * 16)]).join("");
 
-// Visualises the 32 Winternitz (WOTS) hash chains being signed with one-time
+// Visualises the 34 Winternitz (WOTS) hash chains being signed with one-time
 // Keccak-256 reveals. phase: "signing" | "broadcasting" | "done".
 export default function SignatureAnimation({ phase = "signing", caption }) {
   const [active, setActive] = useState(0);
@@ -15,11 +15,11 @@ export default function SignatureAnimation({ phase = "signing", caption }) {
   useEffect(() => {
     if (phase === "signing") {
       timer.current = setInterval(() => {
-        setActive((a) => (a < 32 ? a + 1 : a));
+        setActive((a) => (a < 34 ? a + 1 : a));
         setTicks((t) => t + 1);
       }, 60);
     } else {
-      setActive(32);
+      setActive(34);
     }
     return () => clearInterval(timer.current);
   }, [phase]);
@@ -29,15 +29,15 @@ export default function SignatureAnimation({ phase = "signing", caption }) {
       <div className="mb-4 flex items-center justify-between">
         <div className="flex items-center gap-2 font-mono text-xs uppercase tracking-[0.2em] text-quantum-cyan">
           <Lightning weight="fill" className="h-4 w-4" />
-          Winternitz OTS · 32 Keccak chains
+          Winternitz OTS · 32 + 2 checksum chains
         </div>
         <span className="font-plex-mono text-xs text-quantum-green">
-          {Math.min(active, 32)}/32
+          {Math.min(active, 34)}/34
         </span>
       </div>
 
       <div className="grid grid-cols-4 gap-2 sm:grid-cols-8">
-        {Array.from({ length: 32 }).map((_, i) => {
+        {Array.from({ length: 34 }).map((_, i) => {
           const done = i < active;
           const current = i === active - 1 && phase === "signing";
           return (
